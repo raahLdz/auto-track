@@ -1,0 +1,4 @@
+export const MICROSERVICE_NAMES = {
+    AUTH: 'AUTH_SERVICE',
+    USERS: 'USERS_SERVICE',
+};
