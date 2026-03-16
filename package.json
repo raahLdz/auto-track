@@ -19,13 +19,19 @@
         "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
         "test:e2e": "jest --config ./apps/auto-track/test/jest-e2e.json",
         "release": "semantic-release",
-        "release:dry": "semantic-release --dry-run"
+        "release:dry": "semantic-release --dry-run",
+        "prepare": "husky",
+        "commit": "npx cz"
     },
     "dependencies": {
+        "@commitlint/cli": "^20.4.4",
+        "@commitlint/config-conventional": "^20.4.4",
         "@nestjs/common": "^10.0.0",
         "@nestjs/core": "^10.0.0",
         "@nestjs/microservices": "^11.1.16",
         "@nestjs/platform-express": "^10.0.0",
+        "cz-conventional-changelog": "^3.3.0",
+        "husky": "^9.1.7",
         "reflect-metadata": "^0.2.0",
         "rxjs": "^7.8.1"
     },
@@ -75,6 +81,24 @@
         "moduleNameMapper": {
             "^y/common(|/.*)$": "<rootDir>/libs/common/src/$1",
             "^y/config(|/.*)$": "<rootDir>/libs/config/src/$1"
+        }
+    },
+    "lint-staged": {
+        "apps/**/*.ts": [
+            "eslint --fix",
+            "prettier --write"
+        ],
+        "libs/**/*.ts": [
+            "eslint --fix",
+            "prettier --write"
+        ],
+        "**/*.json": [
+            "prettier --write"
+        ]
+    },
+    "config": {
+        "commitizen": {
+            "path": "cz-conventional-changelog"
         }
     }
 }
