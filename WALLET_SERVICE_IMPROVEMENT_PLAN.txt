@@ -1,0 +1,1149 @@
+================================================================================
+  WALLET SERVICE — PLAN DE MEJORAS Y BUENAS PRÁCTICAS
+  Proyecto: BAP / PTD
+  Servicio: apps/wallet-service
+  Fecha de análisis: 2026-03-23
+  Autor del análisis: Claude Code (Sonnet 4.6)
+================================================================================
+
+ÍNDICE
+------
+  1. Resumen ejecutivo
+  2. Hallazgos críticos en código (bugs activos)
+  3. Capas de mejora y patrones evaluados
+     3.1  CAPA DE INTEGRIDAD
+          - Append-Only Ledger
+          - Compensating Transactions
+          - Soft Deletion
+     3.2  CAPA DE CONCURRENCIA
+          - Optimistic / Pessimistic Locking
+          - Idempotency Pattern
+          - Outbox Pattern
+     3.3  CAPA DE SALDOS
+          - Earmarking Pattern
+          - Minor Units / Decimal Places
+          - Reconciliación
+     3.4  CAPA DE ESCALA
+          - Snapshot Pattern
+          - CQRS
+     3.5  CAPA DE COMPLIANCE
+          - Audit Trail completo
+          - Segregación de Fondos
+          - Velocity Limits
+  4. Matriz de decisión consolidada
+  5. Roadmap de implementación
+  6. Metodología general
+
+
+================================================================================
+1. RESUMEN EJECUTIVO
+================================================================================
+
+El wallet-service es el núcleo financiero del sistema. Maneja saldos de usuarios,
+historiales de movimientos, reservaciones de fondos y desembolsos corporativos.
+
+Durante el análisis se detectaron RIESGOS ACTIVOS que pueden estar causando
+inconsistencias en producción en este momento:
+
+  [CRÍTICO] Race condition en balance.service.ts — lectura y escritura sin lock
+  [CRÍTICO] balance.update() y createHistory() corren en paralelo sin transacción
+  [CRÍTICO] No existe idempotencia — reintentos TCP duplican movimientos
+  [CRÍTICO] No existe reconciliación — daño actual es invisible
+  [MEDIO]   Reservaciones activas no bloquean el saldo disponible
+  [MEDIO]   float64 para montos monetarios — errores de redondeo acumulados
+  [MEDIO]   reference_id aleatorio con 900K valores — colisiones inevitables
+  [MEDIO]   Sin campos de auditoría en historial (actor, IP, servicio origen)
+
+CONTRASTE POSITIVO: disbursements-v2 YA implementa correctamente
+  - Transacciones Spanner atómicas
+  - FOR UPDATE (pessimistic locking)
+  - Cálculo de balances dentro de la transacción
+  El patrón correcto existe en el código — solo falta replicarlo al resto.
+
+
+================================================================================
+2. HALLAZGOS CRÍTICOS EN CÓDIGO (BUGS ACTIVOS)
+================================================================================
+
+------------------------------------------------------------------------
+BUG 1: balance.service.ts — Sin transacción atómica
+Archivo: apps/wallet-service/src/balance/balance.service.ts
+------------------------------------------------------------------------
+
+CÓDIGO ACTUAL (problemático):
+  await Promise.all([
+      this.balanceRepo.update(data.id, { amount: roundToTwoDecimals(newBalance) }),
+      this.createHistory({...}),
+  ]);
+
+PROBLEMA:
+  - Promise.all ejecuta ambas operaciones en paralelo pero independientes
+  - Si createHistory() falla → el balance cambió pero NO queda registro
+  - Si balanceRepo.update() falla → la historia se crea con datos que nunca ocurrieron
+  - No hay rollback. El estado queda corrupto silenciosamente.
+
+SOLUCIÓN CORRECTA (ya existe en disbursements-v2):
+  await spannerTransaction(async (transaction) => {
+      await transaction.run({ sql: `SELECT * FROM wallet_balance WHERE id = @id FOR UPDATE`, ... });
+      await transaction.runUpdate({ sql: `UPDATE wallet_balance SET amount = @amount WHERE id = @id`, ... });
+      await transaction.runInsert('wallet_balance_history', { ...historyData });
+  });
+
+------------------------------------------------------------------------
+BUG 2: balance.service.ts — Race condition (sin locking)
+Archivo: apps/wallet-service/src/balance/balance.service.ts
+------------------------------------------------------------------------
+
+CÓDIGO ACTUAL (problemático):
+  const data = await this.balanceRepo.findOne({ where: { account_id } }); // Lee: $1,000
+  // --- cualquier otra request puede modificar el balance aquí ---
+  newBalance = data.amount - amount;  // Calcula con valor stale
+  await this.balanceRepo.update(data.id, { amount: newBalance }); // Escribe: $900
+  // Si otra request también restó $200 concurrentemente → saldo final $800 en lugar de $600
+
+PROBLEMA:
+  - Dos requests simultáneas de débito pueden ambas leer el mismo balance
+  - Ambas calculan el nuevo saldo sobre el mismo valor base
+  - Una sobreescribe a la otra → saldo incorrecto, movimiento "perdido"
+
+------------------------------------------------------------------------
+BUG 3: reference_id no es idempotente y tiene colisiones
+Archivo: apps/wallet-service/src/balance/entities/balanceHistory.entity.ts
+------------------------------------------------------------------------
+
+CÓDIGO ACTUAL:
+  @BeforeInsert()
+  generateReferenceId() {
+      this.reference_id = Math.floor(100000 + Math.random() * 900000);
+  }
+
+PROBLEMA:
+  - Solo 900,000 valores posibles (100000 a 999999)
+  - Por el birthday paradox, la probabilidad de colisión llega al 50% con ~1,100 registros
+  - Marcado como UNIQUE → la inserción falla con error de BD en lugar de manejarse
+  - No es un idempotency key (no viene del cliente, no previene duplicados)
+
+------------------------------------------------------------------------
+BUG 4: Reservaciones no afectan el saldo disponible
+Archivo: apps/wallet-service/src/balance/balance.service.ts
+         apps/wallet-service/src/balance/entities/balance-reservations.entity.ts
+------------------------------------------------------------------------
+
+SITUACIÓN:
+  - wallet_balance_reservations existe con status (authorized, adjusted, settled)
+  - Al validar si hay fondos suficientes para un débito, el código solo lee balance.amount
+  - Las reservaciones activas (authorized) NO se descuentan del saldo disponible
+  - Un usuario con $1,000 total y $800 reservados puede gastar esos $800
+
+
+================================================================================
+3. CAPAS DE MEJORA Y PATRONES EVALUADOS
+================================================================================
+
+Para cada patrón se incluye:
+  - Descripción del patrón
+  - Estado actual en el código
+  - Qué resuelve
+  - Metodología de implementación detallada
+  - Consideraciones de riesgo
+
+════════════════════════════════════════════════════════════════════════════════
+3.1 CAPA DE INTEGRIDAD
+════════════════════════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 1: APPEND-ONLY LEDGER
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Un ledger (libro contable) es inmutable y append-only: los registros nunca se
+  modifican ni eliminan, solo se agregan. El saldo actual es siempre derivado
+  de sumar todos los movimientos del historial. Este patrón es el estándar en
+  sistemas financieros (contabilidad de doble entrada, blockchain, event sourcing).
+
+  Variante pragmática (recomendada para este sistema):
+  - wallet_balance_history sigue siendo la fuente de verdad y es append-only
+  - wallet_balance.amount es una proyección cacheada recalculada dentro de
+    la misma transacción atómica que crea el registro de historia
+  - La clave es la ATOMICIDAD: historia y balance actualizados juntos o ninguno
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - wallet_balance_history existe y es conceptualmente append-only (no se edita)
+  - PROBLEMA: la actualización de balance.amount y la creación del history record
+    NO están en la misma transacción Spanner → pueden desincronizarse
+  - disbursements-v2 SÍ hace esto correctamente con transacciones Spanner
+
+QUÉ RESUELVE:
+  - Elimina el bug del Promise.all (Bug 1)
+  - Garantiza consistencia entre balance y historial en todo momento
+  - Permite auditar cualquier saldo histórico
+  - Base necesaria para implementar reconciliación
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  FASE 1 — Atomicidad (urgente):
+    1. Inyectar el cliente Spanner (DbPool) en BalanceService
+    2. Reescribir el método update() para usar spannerTransaction()
+    3. Dentro de la transacción:
+       a. SELECT ... FOR UPDATE en wallet_balance (adquiere lock)
+       b. Calcular nuevo saldo
+       c. UPDATE wallet_balance SET amount = @newAmount
+       d. INSERT INTO wallet_balance_history (...values)
+    4. La transacción hace commit atómico o rollback completo
+
+  FASE 2 — Balance como proyección (opcional, futuro):
+    1. Agregar función recalculateBalance(balance_id) que suma el historial
+    2. Usar como validación en reconciliación, no en el flujo principal
+    3. Solo migrar a este modelo si se detectan inconsistencias masivas
+
+  ARCHIVOS A MODIFICAR:
+    - apps/wallet-service/src/balance/balance.service.ts (principal)
+    - apps/wallet-service/src/balance/balance.module.ts (inyectar DbPool)
+
+  REFERENCIA DE IMPLEMENTACIÓN EN EL PROPIO CÓDIGO:
+    - apps/wallet-service/src/card/disbursements-v2/repository-helpers/transaction.ts
+    - apps/wallet-service/src/card/disbursements-v2/disbursements-v2.service.ts
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Medio. Requiere refactor de balance.service.ts pero el patrón ya existe
+  - El DbPool de disbursements-v2 es REQUEST scoped — verificar compatibilidad
+    al inyectarlo en BalanceService
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 2: COMPENSATING TRANSACTIONS
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  En sistemas distribuidos donde una operación lógica involucra múltiples
+  servicios o pasos, si uno falla, se ejecuta una "transacción compensatoria"
+  que revierte los pasos anteriores. Es la alternativa a las transacciones ACID
+  distribuidas (que no son viables entre microservicios).
+
+  Implementación común: Saga Pattern
+  - Choreography-based: cada servicio emite eventos y reacciona a ellos
+  - Orchestration-based: un orquestador coordina el flujo y las compensaciones
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - No existe ningún mecanismo de compensación
+  - disbursements-v2 usa transacciones Spanner que hacen rollback automático
+    → dentro de UN servicio esto ya funciona
+  - El riesgo existe cuando wallet-service interactúa con payment-service,
+    history-service, etc. (flujos cross-servicio sin coordinación)
+
+QUÉ RESUELVE:
+  - Inconsistencias en flujos que involucran múltiples microservicios
+  - Ejemplo: débito en wallet exitoso + fallo en history-service → dinero descontado sin registro
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  OPCIÓN A — Saga Orchestration (recomendada para este sistema):
+    1. Crear una tabla saga_log: { id, type, status, payload, created_at }
+    2. Al iniciar un flujo complejo (e.g., transferencia): insertar saga con status=STARTED
+    3. Ejecutar cada paso y actualizar saga_log
+    4. Si un paso falla: leer saga_log y ejecutar compensaciones en orden inverso
+    5. Marcar saga como COMPENSATED o FAILED
+
+  OPCIÓN B — Idempotent Retry (más simple, menos completo):
+    1. Cada operación tiene idempotency_key
+    2. Si el flujo falla a mitad, el retry detecta qué pasos ya se completaron
+    3. Solo ejecuta los pasos pendientes
+
+  PREREQUISITO: Implementar Ledger atómico (Patrón 1) primero.
+  Sin transacciones Spanner en balance.service.ts, las compensaciones son inútiles
+  porque el estado base ya puede ser inconsistente.
+
+  ARCHIVOS A CREAR:
+    - apps/wallet-service/src/saga/saga-log.entity.ts
+    - apps/wallet-service/src/saga/saga.service.ts
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Medio. Complejidad moderada pero el patrón está bien documentado.
+  - El riesgo baja significativamente si Ledger (Patrón 1) ya está implementado.
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 3: SOFT DELETION
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  En lugar de eliminar físicamente registros de la base de datos (DELETE),
+  se agrega una columna deleted_at (timestamp). Un registro "eliminado" tiene
+  deleted_at != NULL. Las consultas filtran automáticamente los soft-deleted.
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - No existe deleted_at en ninguna entidad del wallet
+  - TypeORM tiene soporte nativo con @DeleteDateColumn() y softDelete()
+
+QUÉ RESUELVE:
+  - Recuperación de errores (cuenta eliminada por mistake → restaurable)
+  - Auditoría completa (saber cuándo y qué se eliminó)
+  - Cumplimiento regulatorio (CNBV puede requerir retención de datos)
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  1. Agregar a entidades clave:
+     @DeleteDateColumn({ name: 'deleted_at', nullable: true })
+     deletedAt: Date;
+
+  2. TypeORM automáticamente:
+     - Filtra registros con deleted_at != NULL en todas las queries
+     - repo.softDelete(id) → pone timestamp en lugar de DELETE
+     - repo.restore(id) → limpia el timestamp
+     - repo.findOne({ withDeleted: true }) → incluye eliminados si se necesita
+
+  ENTIDADES PRIORITARIAS:
+    - apps/wallet-service/src/account/entities/account.entity.ts
+    - apps/wallet-service/src/balance/entities/balance.entity.ts
+    - apps/wallet-service/src/balance/entities/balance-reservations.entity.ts
+
+  MIGRACIÓN REQUERIDA:
+    ALTER TABLE wallet_account ADD COLUMN deleted_at TIMESTAMP NULL;
+    ALTER TABLE wallet_balance ADD COLUMN deleted_at TIMESTAMP NULL;
+    ALTER TABLE wallet_balance_reservations ADD COLUMN deleted_at TIMESTAMP NULL;
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Bajo. Cambio aditivo, no rompe funcionalidad existente.
+  - Verificar que los índices existentes no incluyan filas deleted.
+
+
+════════════════════════════════════════════════════════════════════════════════
+3.2 CAPA DE CONCURRENCIA
+════════════════════════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 4: PESSIMISTIC LOCKING (FOR UPDATE)
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Pessimistic Locking: al leer un registro que se va a modificar, se adquiere
+  un lock exclusivo a nivel de base de datos. Cualquier otra transacción que
+  intente leer/escribir ese registro esperará hasta que el lock se libere.
+  En Spanner: SELECT ... FOR UPDATE dentro de una transacción read-write.
+
+  Optimistic Locking: alternativa donde no se usa lock, sino que se agrega un
+  campo version al registro. Al hacer UPDATE se verifica que version no cambió.
+  Si cambió → conflicto → retry. Mejor para sistemas con baja contención.
+
+  RECOMENDACIÓN PARA ESTE SISTEMA: Pessimistic Locking.
+  Los balances son recursos de alta contención y el costo de un conflicto
+  (saldo incorrecto) es mayor que el overhead del lock.
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - balance.service.ts: findOne() + update() sin lock → race condition activa
+  - disbursements-v2: usa FOR UPDATE correctamente → modelo a seguir
+
+QUÉ RESUELVE:
+  - Elimina completamente la race condition del Bug 2
+  - Garantiza que dos débitos simultáneos no puedan producir saldo incorrecto
+  - Serializa las escrituras al balance de una cuenta
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  Dentro de la transacción Spanner (junto con Patrón 1):
+
+  const lockQuery = {
+      sql: `SELECT id, amount FROM wallet_balance
+            WHERE account_id = @account_id FOR UPDATE`,
+      params: { account_id },
+      json: true,
+  };
+  const [rows] = await transaction.run(lockQuery);
+  const currentBalance = rows[0].amount;
+
+  // Calcular nuevo saldo con valor garantizadamente fresco
+  const newBalance = currentBalance + amount; // o - amount para débito
+
+  await transaction.runUpdate({
+      sql: `UPDATE wallet_balance SET amount = @newBalance WHERE id = @id`,
+      params: { newBalance, id: rows[0].id },
+  });
+
+  NOTA: El FOR UPDATE solo funciona dentro de una transacción read-write de Spanner.
+  Prerequisito directo: implementar Patrón 1 (transacción atómica).
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Bajo. El patrón ya existe en el mismo codebase.
+  - Posible deadlock si dos cuentas se transfieren mutuamente → resolver con
+    orden canónico de locks (siempre lockear por account_id menor primero).
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 5: IDEMPOTENCY PATTERN
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Una operación es idempotente si ejecutarla N veces produce el mismo resultado
+  que ejecutarla 1 vez. En sistemas de pagos, los reintentos son inevitables
+  (timeouts TCP, network errors, gateway retries). Sin idempotencia, cada
+  reintento es un nuevo movimiento de dinero.
+
+  Implementación estándar:
+  1. El CLIENTE genera un UUID v4 único por operación (idempotency_key)
+  2. El SERVIDOR, antes de ejecutar, verifica si ya procesó esa key
+  3. Si ya existe → devuelve la respuesta original cacheada (sin re-ejecutar)
+  4. Si no existe → ejecuta y guarda key + respuesta en tabla idempotency_log
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - No existen idempotency keys en ningún DTO de balance
+  - El reference_id actual es generado server-side aleatoriamente → no es
+    idempotency key (no viene del cliente, no previene duplicados)
+  - Comunicación TCP gateway→wallet-service tiene timeouts → reintentos posibles
+
+QUÉ RESUELVE:
+  - Previene movimientos duplicados por reintentos
+  - Hace las operaciones seguras de re-ejecutar
+  - Permite al cliente reintentar con confianza sin verificar estado previo
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  PASO 1 — Crear tabla idempotency_log:
+    CREATE TABLE wallet_idempotency_log (
+        id          STRING(36)   NOT NULL,  -- UUID
+        key         STRING(255)  NOT NULL,  -- UUID del cliente
+        service     STRING(100)  NOT NULL,  -- 'balance.credit', 'balance.debit'
+        response    JSON,                   -- Respuesta original cacheada
+        created_at  TIMESTAMP    NOT NULL,
+        expires_at  TIMESTAMP,              -- Para limpieza (ej. 24h)
+    ) PRIMARY KEY (key, service);
+
+  PASO 2 — Agregar idempotency_key a DTOs:
+    export class UpdateBalanceDto {
+        @IsUUID('4')
+        idempotency_key: string;
+        // ... resto de campos
+    }
+
+  PASO 3 — Middleware/Guard de idempotencia en el servicio:
+    async function withIdempotency(key, service, operation) {
+        // Verificar si ya existe
+        const existing = await idempotencyRepo.findOne({ where: { key, service } });
+        if (existing) return existing.response; // Devolver respuesta cacheada
+
+        // Ejecutar operación
+        const response = await operation();
+
+        // Guardar resultado
+        await idempotencyRepo.save({ key, service, response, expires_at: ... });
+        return response;
+    }
+
+  PASO 4 — El check de idempotencia debe ser parte de la misma transacción
+    Spanner para evitar race condition entre el check y el insert:
+
+    await spannerTransaction(async (tx) => {
+        // INSERT OR IGNORE en idempotency_log
+        // Si ya existe → ROLLBACK y devolver cached response
+        // Si no existe → ejecutar operación + commit
+    });
+
+  ARCHIVOS A CREAR/MODIFICAR:
+    - apps/wallet-service/src/idempotency/idempotency-log.entity.ts (nuevo)
+    - apps/wallet-service/src/idempotency/idempotency.service.ts (nuevo)
+    - apps/wallet-service/src/balance/dto/update-balance.dto.ts (agregar campo)
+    - apps/wallet-service/src/balance/balance.service.ts (usar IdempotencyService)
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Medio. Requiere cambios en DTOs (breaking change para el gateway).
+  - Coordinar con el equipo que consume el servicio para agregar la key.
+  - La tabla de idempotency_log requiere limpieza periódica (job/cron).
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 6: OUTBOX PATTERN
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Garantiza que los cambios en base de datos y la publicación de eventos/mensajes
+  sean atómicos. Sin este patrón: si el servicio publica un evento y luego
+  persiste en BD (o viceversa) y falla entre ambas operaciones, el sistema
+  queda inconsistente (evento publicado sin BD actualizada, o BD actualizada
+  sin evento publicado).
+
+  Implementación:
+  1. La operación escribe en BD + inserta en tabla outbox (misma transacción)
+  2. Un worker separado lee la tabla outbox y publica los mensajes al broker
+  3. Una vez publicado exitosamente, marca el registro outbox como procesado
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - wallet-service se comunica principalmente por TCP síncrono → riesgo bajo
+  - Interactúa con producer-service para eventos async (notificaciones, etc.)
+  - Si el servicio falla entre actualizar BD y notificar → evento perdido
+
+QUÉ RESUELVE:
+  - Garantía exactly-once para eventos/notificaciones críticas
+  - No se pierden eventos aunque el servicio crashee
+
+CUÁNDO IMPLEMENTAR:
+  - Solo si los eventos son críticos para operaciones de negocio
+  - Si son solo notificaciones informativas (push notifications), el riesgo es
+    aceptable (at-most-once delivery)
+  - Implementar después de Ledger e Idempotency (mayor prioridad)
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  PASO 1 — Tabla outbox:
+    CREATE TABLE wallet_outbox (
+        id          STRING(36)  NOT NULL,
+        event_type  STRING(100) NOT NULL,
+        payload     JSON        NOT NULL,
+        status      STRING(20)  NOT NULL DEFAULT 'PENDING',
+        created_at  TIMESTAMP   NOT NULL,
+        processed_at TIMESTAMP,
+    ) PRIMARY KEY (id);
+
+  PASO 2 — Escribir en outbox dentro de la transacción Spanner:
+    await spannerTransaction(async (tx) => {
+        // ... actualizar balance e historia ...
+        await tx.insert('wallet_outbox', {
+            id: uuid(),
+            event_type: 'BALANCE_UPDATED',
+            payload: JSON.stringify({ account_id, amount, type }),
+            status: 'PENDING',
+            created_at: new Date(),
+        });
+    });
+
+  PASO 3 — Worker que lee y publica:
+    // Cron job cada N segundos
+    const pending = await outboxRepo.find({ where: { status: 'PENDING' } });
+    for (const event of pending) {
+        await producerService.publish(event.event_type, event.payload);
+        await outboxRepo.update(event.id, { status: 'PROCESSED', processed_at: new Date() });
+    }
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Alto. Requiere worker adicional, manejo de exactly-once en el broker,
+    y coordinación con producer-service.
+  - Se recomienda evaluar si el sistema tiene casos de pérdida de eventos
+    antes de invertir en esta implementación.
+
+
+════════════════════════════════════════════════════════════════════════════════
+3.3 CAPA DE SALDOS
+════════════════════════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 7: EARMARKING (RESERVACIÓN DE FONDOS)
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Earmarking (marcar fondos) es el proceso de reservar una porción del saldo
+  para una transacción pendiente, reduciendo el "saldo disponible" aunque el
+  saldo total no haya cambiado. Análogo a una pre-autorización en tarjetas.
+
+  Saldo Total     = wallet_balance.amount
+  Saldo Reservado = SUM(wallet_balance_reservations WHERE status = 'authorized')
+  Saldo Disponible = Saldo Total - Saldo Reservado
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - wallet_balance_reservations existe con status (authorized, adjusted, settled)
+  - En balance.service.ts la validación de fondos solo usa balance.amount
+  - Las reservas NO afectan el saldo disponible para nuevas operaciones
+  - Un usuario puede gastar fondos ya comprometidos en una reserva activa
+
+QUÉ RESUELVE:
+  - Previene sobreutilización de fondos reservados
+  - Modela correctamente el ciclo de vida de una transacción con pre-autorización
+  - Necesario si se manejan pagos con ventana de tiempo (TPV, compras en 2 pasos)
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  PASO 1 — Función de saldo disponible:
+    async function getAvailableBalance(accountId: string): Promise<number> {
+        const balance = await balanceRepo.findOne({ where: { account_id: accountId } });
+        const reservedAmount = await reservationRepo
+            .createQueryBuilder('r')
+            .select('SUM(r.amount)', 'total')
+            .where('r.balance_id = :balanceId', { balanceId: balance.id })
+            .andWhere('r.status = :status', { status: 'authorized' })
+            .getRawOne();
+        return balance.amount - (reservedAmount.total || 0);
+    }
+
+  PASO 2 — Usar saldo disponible en validaciones de débito:
+    // En balance.service.ts, cambiar:
+    // if (data.amount - amount < 0 && !isDebt) { throw ... }
+    // Por:
+    const available = await getAvailableBalance(account_id);
+    if (available - amount < 0 && !isDebt) { throw ... }
+
+  PASO 3 — Ciclo de vida completo de reservación:
+    AUTHORIZE  → Crear reserva (status: authorized), saldo disponible baja
+    ADJUST     → Modificar monto (status: adjusted), recalcular disponible
+    SETTLE     → Confirmar (débito real + status: settled), saldo total baja
+    VOID/CANCEL → Eliminar reserva, saldo disponible sube de nuevo
+
+  ARCHIVOS A MODIFICAR:
+    - apps/wallet-service/src/balance/balance.service.ts
+    - apps/wallet-service/src/balance/reservations/reservations-balance.service.ts
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Medio. Requiere verificar que ningún flujo actual dependa de poder gastar
+    fondos reservados (comportamiento actual pero incorrecto).
+  - Hacer en conjunto con Pessimistic Locking para evitar race condition
+    entre el cálculo del available balance y el débito.
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 8: MINOR UNITS / DECIMAL PLACES
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Almacenar montos monetarios como enteros en la unidad mínima de la moneda
+  (centavos para MXN/USD). $100.50 MXN se almacena como 10050 (centavos).
+  Elimina completamente los errores de punto flotante en operaciones monetarias.
+
+  Alternativa menos invasiva: usar la librería decimal.js para aritmética
+  decimal de precisión arbitraria, manteniendo el esquema actual.
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - Todos los campos de monto usan float64 (IEEE 754 doble precisión)
+  - Existe roundToTwoDecimals() que mitiga parcialmente el problema
+  - El redondeo se aplica al resultado, no previene errores intermedios
+  - Ejemplo: (0.1 + 0.2) = 0.30000000000000004 en JavaScript
+    roundToTwoDecimals(0.1 + 0.2) = 0.30 ✓ (corregido)
+    Pero con muchas operaciones acumuladas el error puede ser mayor
+
+QUÉ RESUELVE:
+  - Elimina completamente los errores de aritmética de punto flotante
+  - Garantiza exactitud matemática en todas las operaciones monetarias
+  - Estándar de la industria financiera
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  OPCIÓN A — Minor Units (recomendada a largo plazo, más invasiva):
+    1. Migrar esquema: float64 → int64 en todos los campos de monto
+       ALTER TABLE wallet_balance MODIFY COLUMN amount INT64;
+    2. Migrar datos: UPDATE wallet_balance SET amount = CAST(amount * 100 AS INT64);
+    3. Actualizar toda la lógica: dividir entre 100 al mostrar al usuario
+    4. Actualizar interfaces hacia afuera (gateway, DTOs, responses)
+    5. Coordinar con equipo de frontend
+
+  OPCIÓN B — decimal.js (recomendada a corto plazo, menos invasiva):
+    1. npm install decimal.js
+    2. Importar en balance.service.ts y reemplazar aritmética:
+       // Antes:
+       newBalance = data.amount + amount;
+       // Después:
+       const newBalance = new Decimal(data.amount).plus(amount).toNumber();
+    3. No requiere cambio de esquema ni migración de datos
+    4. roundToTwoDecimals() sigue siendo útil para validaciones de input
+
+  ARCHIVOS A MODIFICAR (Opción B):
+    - apps/wallet-service/src/balance/balance.service.ts
+    - libs/common/src/utils/numerics.utils.ts
+    - Crear migración para cada servicio afectado
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Opción A: Alto. Migración de datos existentes es crítica y difícil de revertir.
+  - Opción B: Bajo. Solo cambio de librería en la capa de servicio.
+  RECOMENDACIÓN: Opción B ahora, Opción A en ventana de mantenimiento planificada.
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 9: RECONCILIACIÓN
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Proceso periódico (o continuo) que verifica la consistencia entre:
+  - El saldo actual registrado en wallet_balance.amount
+  - La suma de todos los movimientos en wallet_balance_history para esa cuenta
+  Cualquier diferencia indica una inconsistencia que debe investigarse.
+
+  Es el proceso contable análogo al cuadre de caja diario.
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - No existe ningún proceso de reconciliación
+  - Los bugs activos (Promise.all sin transacción) pueden haber causado
+    desincronizaciones que actualmente son INVISIBLES
+  - No hay forma de saber si ya hay daño en producción
+
+QUÉ RESUELVE:
+  - Detecta inconsistencias existentes antes de que el Ledger esté implementado
+  - Cuantifica el daño actual por el bug del Promise.all
+  - Proporciona confianza en la integridad de los datos
+  - Base para corrección de datos si se encuentran discrepancias
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  PASO 1 — Script de diagnóstico (solo lectura, cero riesgo):
+    SELECT
+        b.id                    AS balance_id,
+        b.account_id,
+        b.amount                AS balance_actual,
+        COALESCE(
+            SUM(CASE WHEN h.movement_type = 'Crédito' THEN h.amount ELSE 0 END) -
+            SUM(CASE WHEN h.movement_type = 'Débito'  THEN h.amount ELSE 0 END),
+        0)                      AS balance_calculado_desde_historia,
+        b.amount - COALESCE(
+            SUM(CASE WHEN h.movement_type = 'Crédito' THEN h.amount ELSE 0 END) -
+            SUM(CASE WHEN h.movement_type = 'Débito'  THEN h.amount ELSE 0 END),
+        0)                      AS diferencia
+    FROM wallet_balance b
+    LEFT JOIN wallet_balance_history h ON h.balance_id = b.id
+    GROUP BY b.id, b.account_id, b.amount
+    HAVING ABS(diferencia) > 0.01
+    ORDER BY ABS(diferencia) DESC;
+
+  PASO 2 — Job de reconciliación periódica:
+    // Cron diario (horario de baja transaccionalidad)
+    async function runReconciliation() {
+        const discrepancies = await detectDiscrepancies();
+        if (discrepancies.length > 0) {
+            await alertingService.notify('RECONCILIATION_FAILURE', discrepancies);
+            // NO corregir automáticamente — solo alertar para investigación manual
+        }
+    }
+
+  PASO 3 — Dashboard de integridad:
+    - Métrica: número de cuentas con diferencia > $0.01
+    - Alerta: cualquier diferencia > $1.00
+    - Tendencia: si aumenta → hay un bug activo produciendo inconsistencias
+
+  ARCHIVOS A CREAR:
+    - apps/wallet-service/src/reconciliation/reconciliation.service.ts
+    - apps/wallet-service/src/reconciliation/reconciliation.module.ts
+    - Script SQL: tools/reconciliation-diagnostic.sql
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Bajo. Proceso de solo lectura. No modifica datos.
+  - MÁXIMA PRIORIDAD: debe ejecutarse ANTES de implementar cualquier otro patrón
+    para tener una línea base del estado actual de los datos.
+
+
+════════════════════════════════════════════════════════════════════════════════
+3.4 CAPA DE ESCALA
+════════════════════════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 10: SNAPSHOT PATTERN
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  En sistemas donde el estado se calcula desde el historial completo de eventos
+  (Ledger puro), el costo de leer todos los registros históricos crece con el
+  tiempo. El Snapshot Pattern resuelve esto guardando periódicamente el estado
+  calculado hasta un punto en el tiempo.
+
+  Para calcular el saldo actual:
+    saldo = snapshot.amount + SUM(history WHERE created_at > snapshot.created_at)
+  En lugar de:
+    saldo = SUM(historia completa desde el inicio)
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - No aplica aún. El saldo se lee directamente de wallet_balance.amount
+  - Solo se necesita si se implementa Ledger puro (balance calculado desde historia)
+
+CUÁNDO IMPLEMENTAR:
+  - Solo si el Ledger Pattern se implementa en su forma completa (Fase 2)
+  - Solo si se detectan problemas de rendimiento en cuentas con historial largo
+  - No implementar prematuramente
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Medio. Requiere coordinar la generación de snapshots con la escritura del ledger.
+  - Prerequisito estricto: Ledger Pattern implementado completamente.
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 11: CQRS (Command Query Responsibility Segregation)
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Separación completa del modelo de escritura (Commands: modifican estado) y
+  el modelo de lectura (Queries: consultan estado). Pueden tener bases de datos,
+  modelos de datos, y servicios completamente diferentes.
+
+  - Write side: optimizado para consistencia y transacciones (Spanner)
+  - Read side: optimizado para velocidad de consulta (puede ser Redis, BigQuery,
+    una réplica de lectura, etc.)
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - No existe. Lecturas y escrituras usan los mismos repositorios TypeORM.
+  - El sistema actual no tiene problemas de rendimiento que lo justifiquen.
+
+CUÁNDO IMPLEMENTAR:
+  - Cuando lecturas frecuentes compiten con escrituras por recursos de BD
+  - Cuando se necesitan vistas agregadas complejas (reportes, dashboards)
+  - NO implementar antes de tener los problemas de integridad resueltos
+
+RECOMENDACIÓN: NO implementar ahora. Alta complejidad, bajo beneficio en el
+estado actual del sistema.
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Alto. Requiere sincronización de dos modelos de datos, eventual consistency
+    en lecturas, y una arquitectura de eventos madura.
+
+
+════════════════════════════════════════════════════════════════════════════════
+3.5 CAPA DE COMPLIANCE
+════════════════════════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 12: AUDIT TRAIL COMPLETO
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Registro inmutable de QUIÉN hizo QUÉ, CUÁNDO, DESDE DÓNDE y POR QUÉ.
+  No solo el resultado de la operación, sino el contexto completo:
+  actor, IP, servicio origen, request ID, y cualquier metadata relevante.
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  wallet_balance_history tiene:
+  ✓ balance_before_transaction, balance_after_transaction
+  ✓ movement_type (Débito/Crédito)
+  ✓ concept, related_id
+  ✓ user_id (nullable — no siempre se llena)
+  ✗ FALTAN: ip_address, actor_type, origin_service, request_id, session_id
+
+QUÉ RESUELVE:
+  - Investigación de disputas (¿quién autorizó este movimiento?)
+  - Cumplimiento regulatorio (CNBV, CONDUSEF, PCI-DSS)
+  - Forensics ante incidentes de seguridad
+  - Trazabilidad end-to-end de una transacción
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  PASO 1 — Agregar columnas a wallet_balance_history:
+    ALTER TABLE wallet_balance_history ADD COLUMN actor_id      STRING(36)  NULL;
+    ALTER TABLE wallet_balance_history ADD COLUMN actor_type    STRING(50)  NULL;
+    -- Valores: 'USER', 'ADMIN', 'SYSTEM', 'EXTERNAL_SERVICE'
+    ALTER TABLE wallet_balance_history ADD COLUMN origin_service STRING(100) NULL;
+    -- Valores: 'wallet-service', 'payment-service', 'disbursements-v2'
+    ALTER TABLE wallet_balance_history ADD COLUMN request_id    STRING(36)  NULL;
+    ALTER TABLE wallet_balance_history ADD COLUMN ip_address    STRING(45)  NULL;
+
+  PASO 2 — Propagar contexto desde el gateway:
+    // En el gateway, inyectar en el mensaje TCP:
+    {
+        data: { ...payload },
+        meta: {
+            actor_id: req.user.id,
+            actor_type: 'USER',
+            origin_service: 'gateway',
+            request_id: req.headers['x-request-id'],
+            ip_address: req.ip,
+        }
+    }
+
+  PASO 3 — Usar contexto al crear history record:
+    await this.createHistory({
+        ...balanceData,
+        actor_id: meta.actor_id,
+        actor_type: meta.actor_type,
+        origin_service: meta.origin_service,
+        request_id: meta.request_id,
+    });
+
+  ARCHIVOS A MODIFICAR:
+    - apps/wallet-service/src/balance/entities/balanceHistory.entity.ts
+    - apps/wallet-service/src/balance/balance.service.ts
+    - apps/gateway/src/... (rutas que llaman a wallet-service)
+    - libs/interfaces/src/... (interfaces de mensajes TCP)
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Bajo. Cambio aditivo en entidad y servicio. No rompe funcionalidad existente.
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 13: SEGREGACIÓN DE FONDOS
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Los fondos de diferentes tipos de clientes (usuarios finales, empresas,
+  operacionales) se mantienen en cuentas separadas, claramente identificables
+  y no intercambiables sin aprobación explícita. Requerido por regulación
+  financiera en México (IFPE, SOFOM) para proteger los fondos de los clientes.
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - wallet_balance y wallet_company_balance_history son entidades separadas
+  - No existe validación que impida mezclar fondos de empresa y usuario
+  - No hay clasificación explícita de tipo de fondo en las transacciones
+
+CUÁNDO IMPLEMENTAR:
+  - Requerido si el negocio tiene licencia IFPE o similar ante CNBV
+  - Necesario si se mantienen fondos de terceros (clientes corporativos)
+  - Evaluar con el área legal/compliance el alcance regulatorio
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Medio. Requiere rediseño del modelo de cuentas y validaciones adicionales.
+
+────────────────────────────────────────────────────────────────────────────────
+PATRÓN 14: VELOCITY LIMITS (LÍMITES DE VELOCIDAD)
+────────────────────────────────────────────────────────────────────────────────
+
+DESCRIPCIÓN DEL PATRÓN:
+  Controles que limitan la frecuencia o volumen de transacciones en ventanas
+  de tiempo determinadas. Doble propósito: control de fraude y cumplimiento
+  regulatorio (CNBV limita montos por operación en cuentas nivel 1/2/3).
+
+  Ejemplos:
+  - Máximo $10,000 MXN por transacción (nivel de cuenta)
+  - Máximo $50,000 MXN por día acumulado
+  - Máximo 10 transacciones por hora
+  - Alertar si hay más de 3 transacciones en 5 minutos
+
+ESTADO ACTUAL EN EL CÓDIGO:
+  - No existen límites de velocidad en ningún flujo
+  - Solo hay limit_amount en wallet_balance (límite de crédito, no de velocidad)
+  - No hay detección de patrones anómalos
+
+QUÉ RESUELVE:
+  - Prevención de fraude (tarjeta robada haciendo múltiples transacciones)
+  - Cumplimiento regulatorio CNBV (niveles de cuenta)
+  - Detección de comportamiento inusual
+
+METODOLOGÍA DE IMPLEMENTACIÓN:
+
+  PASO 1 — Tabla de reglas de velocidad:
+    CREATE TABLE wallet_velocity_rules (
+        id          STRING(36)   NOT NULL,
+        rule_name   STRING(100)  NOT NULL,
+        account_type STRING(50)  NOT NULL,  -- 'USER', 'COMPANY', 'ALL'
+        window_seconds INT64     NOT NULL,  -- Ventana de tiempo en segundos
+        max_amount  FLOAT64,                -- Monto máximo en la ventana
+        max_count   INT64,                  -- Cantidad máxima de transacciones
+        action      STRING(20)   NOT NULL,  -- 'BLOCK', 'ALERT', 'REQUIRE_2FA'
+        is_active   BOOL         NOT NULL DEFAULT TRUE,
+    ) PRIMARY KEY (id);
+
+  PASO 2 — Evaluación antes de ejecutar:
+    async function checkVelocityLimits(accountId, amount, type) {
+        const rules = await velocityRulesRepo.find({ where: { is_active: true } });
+        for (const rule of rules) {
+            const windowStart = new Date(Date.now() - rule.window_seconds * 1000);
+            const recentTxCount = await historyRepo.count({
+                where: { balance_id: ..., created_at: MoreThan(windowStart) }
+            });
+            const recentTxAmount = await historyRepo.sum('amount', {
+                where: { balance_id: ..., created_at: MoreThan(windowStart) }
+            });
+            if (rule.max_count && recentTxCount >= rule.max_count) throw VELOCITY_EXCEEDED;
+            if (rule.max_amount && recentTxAmount + amount > rule.max_amount) throw VELOCITY_EXCEEDED;
+        }
+    }
+
+  ARCHIVOS A CREAR/MODIFICAR:
+    - apps/wallet-service/src/velocity/velocity-rules.entity.ts (nuevo)
+    - apps/wallet-service/src/velocity/velocity.service.ts (nuevo)
+    - apps/wallet-service/src/balance/balance.service.ts (llamar a velocity check)
+
+RIESGOS DE IMPLEMENTACIÓN:
+  - Medio. Las reglas deben calibrarse cuidadosamente para no bloquear
+    operaciones legítimas. Iniciar en modo ALERT antes de modo BLOCK.
+
+
+================================================================================
+4. MATRIZ DE DECISIÓN CONSOLIDADA
+================================================================================
+
+Escala: BAJO / MEDIO / ALTO / CRÍTICO
+
+#  Patrón                      Impl.  Riesgo activo  Urgencia  Viabilidad  Impacto datos  Reversibilidad  Depende de       Rec.
+-- ----------------------------  -----  -------------  --------  ----------  -------------  --------------  ---------------  -----
+01 Append-Only Ledger (atomic)  Medio  CRÍTICO        CRÍTICA   Alta        Medio          Media           —                ✅ SÍ
+02 Pessimistic Locking          Bajo   CRÍTICO        CRÍTICA   Alta        Bajo           Alta            #01              ✅ SÍ
+03 Idempotency Pattern          Medio  CRÍTICO        CRÍTICA   Alta        Medio          Media           —                ✅ SÍ
+04 Reconciliación               Bajo   CRÍTICO        CRÍTICA   Alta        Solo lectura   Alta            —                ✅ SÍ YA
+05 Compensating Transactions    Medio  Medio          Media     Alta        Bajo           Alta            #01              ✅ SÍ
+06 Soft Deletion                Bajo   Bajo-Medio     Baja      Alta        Bajo           Alta            —                ✅ SÍ
+07 Earmarking Pattern           Medio  Medio          Media     Alta        Bajo           Alta            #02              ✅ SÍ
+08 Audit Trail completo         Bajo   Medio          Media     Alta        Medio          Alta            —                ✅ SÍ
+09 Velocity Limits              Medio  Medio          Baja-Med  Alta        Bajo           Alta            #03              ✅ SÍ
+10 Minor Units (decimal.js)     Bajo   Medio          Media     Alta        Bajo*          Alta            —                ⚠️ COND
+11 Minor Units (int migration)  Alto   Medio          Media     Media       ALTO           BAJA            —                ⚠️ COND
+12 Outbox Pattern               Alto   Medio          Baja-Med  Media       Medio          Media           #01              ⚠️ COND
+13 Segregación de Fondos        Medio  Medio          Baja-Med  Media       Medio          Media           #07              ⚠️ COND
+14 Snapshot Pattern             Medio  Bajo           Baja      Alta        Medio          Media           #01 (fase 2)     ⚠️ COND
+15 CQRS                         Alto   Bajo           Baja      Media       Medio          BAJA            #01, #14         ❌ NO
+
+(*) decimal.js no cambia el esquema de BD, solo la capa de servicio
+
+LEYENDA:
+  ✅ SÍ      → Implementar. Claro beneficio, riesgo de implementación manejable.
+  ⚠️ COND    → Condicional. Evaluar según contexto del negocio antes de implementar.
+  ❌ NO      → No implementar ahora. Complejidad no justificada en este momento.
+
+
+================================================================================
+5. ROADMAP DE IMPLEMENTACIÓN
+================================================================================
+
+SPRINT 1 — SEMANA 1-2 (Bugs activos críticos)
+──────────────────────────────────────────────
+  [DÍA 1]   Reconciliación — Ejecutar script de diagnóstico SQL
+             → Determinar si ya hay daño en producción y su magnitud
+
+  [DÍA 2-3] Pessimistic Locking + Ledger atómico
+             → Refactorizar balance.service.ts para usar SpannerTransaction
+             → Replicar patrón de disbursements-v2
+             → Test: operaciones concurrentes no producen saldo incorrecto
+
+  [DÍA 4-5] Reconciliación periódica
+             → Implementar job que corra diariamente
+             → Alertas si se detectan diferencias
+
+SPRINT 2 — SEMANA 3-4
+──────────────────────
+  Idempotency Pattern
+  → Crear tabla idempotency_log
+  → Agregar idempotency_key a DTOs de balance
+  → Coordinar cambio con equipo de gateway
+  → Test: mismo idempotency_key + 10 requests → 1 solo movimiento
+
+  Audit Trail
+  → Agregar columnas a wallet_balance_history
+  → Propagar contexto de actor desde gateway
+  → Migración de datos: columnas nullable, no rompe historia existente
+
+  Soft Deletion
+  → Agregar @DeleteDateColumn a entidades Account, Balance, Reservations
+  → Migración: agregar columna deleted_at nullable
+
+SPRINT 3 — MES 1
+────────────────
+  Earmarking Pattern
+  → Implementar getAvailableBalance()
+  → Modificar validación de débito para usar saldo disponible
+  → Test: reserva activa impide gastar fondos comprometidos
+
+  Compensating Transactions
+  → Identificar flujos cross-servicio existentes
+  → Implementar saga_log para los flujos más críticos
+
+  Velocity Limits
+  → Crear tabla velocity_rules con reglas configurables
+  → Iniciar en modo ALERT (sin bloqueo) para calibrar
+  → Activar modo BLOCK una vez calibrado
+
+CONDICIONAL — MES 2+
+────────────────────
+  Minor Units con decimal.js (opción conservadora)
+  → Instalar decimal.js
+  → Reemplazar aritmética en balance.service.ts
+  → Sin migración de BD requerida
+
+  Outbox Pattern
+  → Solo si se confirma pérdida de eventos en producción
+  → Requiere análisis de logs del producer-service
+
+  Segregación de Fondos
+  → Solo si hay requerimiento legal/regulatorio confirmado
+  → Requiere análisis del área de compliance
+
+  Minor Units full (migración a int64)
+  → Solo en ventana de mantenimiento planificada con toda la organización
+  → Requiere coordinación con frontend y todos los servicios consumidores
+
+NO IMPLEMENTAR (por ahora)
+────────────────────────
+  Snapshot Pattern → Solo si Ledger puro está implementado y hay performance issues
+  CQRS            → No hay evidencia de problemas de escala que lo justifiquen
+
+
+================================================================================
+6. METODOLOGÍA GENERAL
+================================================================================
+
+PRINCIPIOS DE IMPLEMENTACIÓN
+─────────────────────────────
+  1. PRIMERO MEDIR, LUEGO ARREGLAR
+     Ejecutar reconciliación antes de cualquier cambio para establecer
+     línea base del estado actual. No modificar datos hasta saber su estado.
+
+  2. CAMBIOS ADITIVOS ANTES QUE DISRUPTIVOS
+     Agregar columnas nullable, nuevas tablas, y nuevos servicios antes de
+     modificar flujos existentes. Menor riesgo de romper funcionalidad actual.
+
+  3. PATRÓN EXISTENTE COMO REFERENCIA
+     disbursements-v2 ya implementa correctamente transacciones Spanner,
+     FOR UPDATE, y cálculo atómico. Replicar este patrón al código legacy
+     en lugar de reinventar la solución.
+
+  4. FEATURE FLAGS PARA MIGRACIONES CRÍTICAS
+     Usar variables de entorno o feature flags para activar/desactivar
+     el nuevo comportamiento sin necesidad de deploy. Permite rollback
+     en segundos si algo sale mal en producción.
+     Ejemplo:
+       ENABLE_ATOMIC_BALANCE_UPDATE=true
+       ENABLE_IDEMPOTENCY_CHECK=false
+
+  5. TESTS ANTES DE DEPLOY
+     Para cada cambio en balance.service.ts, implementar tests de:
+       a) Operaciones concurrentes (race condition)
+       b) Fallo parcial (simular error en history insert)
+       c) Idempotencia (mismo request N veces → mismo resultado)
+       d) Reconciliación (saldo == suma del historial post-operación)
+
+  6. INCREMENTALIDAD
+     Cada sprint debe dejar el sistema en un estado estable y deployable.
+     No acumular cambios de múltiples sprints en un solo deploy.
+     Priorizar estabilidad sobre completitud de la implementación.
+
+ESTRATEGIA DE MIGRACIÓN DE DATOS
+──────────────────────────────────
+  Para cambios que requieren modificar datos existentes:
+
+  PASO 1 — Columna dual (write both, read old):
+    Agregar nueva columna sin eliminar la antigua.
+    El código escribe en ambas pero lee de la antigua.
+
+  PASO 2 — Backfill:
+    Job de migración que rellena la nueva columna para registros históricos.
+    Sin downtime. Se puede pausar y continuar.
+
+  PASO 3 — Switch (write both, read new):
+    Una vez backfill completo, cambiar lectura a la nueva columna.
+    Monitorear por N días.
+
+  PASO 4 — Cleanup:
+    Eliminar la columna antigua. Eliminar código dual-write.
+
+CRITERIOS DE ÉXITO
+───────────────────
+  Para validar que cada implementación es correcta:
+
+  Ledger atómico:
+    [ ] Reconciliación no detecta ninguna diferencia después del cambio
+    [ ] Simulación de fallo en history insert → transaction rollback completo
+    [ ] Carga concurrente (100 req/s) → sin saldos incorrectos
+
+  Idempotency:
+    [ ] Mismo idempotency_key enviado 100 veces → exactamente 1 movimiento en BD
+    [ ] Key diferente por operación → movimientos se crean normalmente
+
+  Earmarking:
+    [ ] Cuenta con reserva activa de $500 y saldo de $500 → débito de $100 rechazado
+    [ ] Reserva cancelada → débito de $100 aceptado
+
+  Velocity Limits:
+    [ ] 11 transacciones en ventana de 10 → número 11 rechazada o alertada
+    [ ] Regla desactivada → no afecta transacciones
+
+HERRAMIENTAS Y DEPENDENCIAS
+────────────────────────────
+  Existentes (no requieren instalación):
+    - @google-cloud/spanner      → ya usado en disbursements-v2
+    - typeorm                    → ya usado en todo el proyecto
+    - class-validator            → ya usado en DTOs
+    - uuid                       → ya disponible en Node.js
+
+  Nuevas (requieren evaluación):
+    - decimal.js                 → aritmética decimal (Minor Units opción B)
+    - @nestjs/schedule           → cron jobs (Reconciliación, Outbox worker)
+
+REFERENCIAS TÉCNICAS
+─────────────────────
+  Código existente de referencia:
+    apps/wallet-service/src/card/disbursements-v2/repository-helpers/transaction.ts
+    apps/wallet-service/src/card/disbursements-v2/disbursements-v2.service.ts
+    apps/wallet-service/src/card/disbursements-v2/db-module/db-pool.ts
+    libs/common/src/utils/numerics.utils.ts
+
+  Entidades afectadas:
+    apps/wallet-service/src/balance/entities/balance.entity.ts
+    apps/wallet-service/src/balance/entities/balanceHistory.entity.ts
+    apps/wallet-service/src/balance/entities/balance-reservations.entity.ts
+    apps/wallet-service/src/account/entities/account.entity.ts
+
+  Servicios a refactorizar (Sprint 1):
+    apps/wallet-service/src/balance/balance.service.ts
+
+================================================================================
+  FIN DEL DOCUMENTO
+  Generado por: Claude Code (Sonnet 4.6)
+  Repositorio: BAP/PTD — branch dev
+  Última actualización: 2026-03-23
+================================================================================
