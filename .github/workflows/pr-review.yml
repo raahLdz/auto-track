@@ -1,0 +1,323 @@
+name: PR Review — Claude Code
+
+# Revisión automática de PRs usando Claude Code Action.
+#
+# Soporta dos métodos de autenticación — cambiar con el variable del repo:
+#   GitHub → Settings → Variables → Actions → CLAUDE_AUTH_METHOD
+#
+#   CLAUDE_AUTH_METHOD = oauth    → usa CLAUDE_CODE_OAUTH_TOKEN (suscripción Pro/Max, sin costo de API)
+#   CLAUDE_AUTH_METHOD = apikey   → usa ANTHROPIC_API_KEY (consume créditos de API)
+#
+# Secrets requeridos (configurar ambos para poder hacer switch sin fricción):
+#   CLAUDE_CODE_OAUTH_TOKEN  →  obtener con: security find-generic-password -s "Claude Code-credentials" -w | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['claudeAiOauth']['accessToken'])"
+#   ANTHROPIC_API_KEY        →  obtener en: https://console.anthropic.com/settings/keys
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    branches: [main, stage, dev]
+
+jobs:
+  review:
+    name: Claude Code Review
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Modo OAuth — suscripción Pro/Max, sin costo de API.
+      # Requiere que el workflow en la rama del PR sea idéntico al de main (validación OIDC).
+      - name: Review PR con Claude Code (OAuth)
+        if: vars.CLAUDE_AUTH_METHOD != 'apikey'
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: true
+          prompt: &review_prompt |
+            Revisa el PR #${{ github.event.pull_request.number }} del repositorio BAP-Corporativo/FinvaApp.
+
+            Sigue exactamente las instrucciones definidas en .claude/commands/review-pr.md.
+
+            Contexto del PR:
+            - Título: ${{ github.event.pull_request.title }}
+            - Autor: ${{ github.event.pull_request.user.login }}
+            - Rama: ${{ github.event.pull_request.head.ref }} → ${{ github.event.pull_request.base.ref }}
+
+            Al finalizar el análisis:
+            1. Publica la revisión completa como comentario en el PR:
+               gh pr comment ${{ github.event.pull_request.number }} --repo BAP-Corporativo/FinvaApp --body "[revisión completa]"
+            2. Guarda un resumen ejecutivo en /tmp/pr_review_summary.txt con este formato exacto
+               (máximo 15 líneas, sin markdown, solo texto plano):
+               VEREDICTO: APROBADO_SIN_OBSERVACIONES | APROBADO_CON_ADVERTENCIAS | REQUIERE_CAMBIOS
+               CRITICOS: Ninguno | <lista separada por comas>
+               ADVERTENCIAS: Ninguna | <lista separada por comas>
+               POSITIVOS: <lista breve separada por comas>
+
+               Criterios de veredicto:
+               - APROBADO_SIN_OBSERVACIONES: sin problemas críticos ni advertencias
+               - APROBADO_CON_ADVERTENCIAS: sin problemas críticos, pero hay advertencias o mejoras menores
+               - REQUIERE_CAMBIOS: hay al menos un problema crítico que debe corregirse antes del merge
+
+      # Modo API Key — consume créditos de Anthropic.
+      # No usa OIDC, funciona aunque el workflow difiera de main. Ideal durante desarrollo.
+      - name: Review PR con Claude Code (API Key)
+        if: vars.CLAUDE_AUTH_METHOD == 'apikey'
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          show_full_output: true
+          prompt: |
+            Revisa el PR #${{ github.event.pull_request.number }} del repositorio BAP-Corporativo/FinvaApp.
+
+            Sigue exactamente las instrucciones definidas en .claude/commands/review-pr.md.
+
+            Contexto del PR:
+            - Título: ${{ github.event.pull_request.title }}
+            - Autor: ${{ github.event.pull_request.user.login }}
+            - Rama: ${{ github.event.pull_request.head.ref }} → ${{ github.event.pull_request.base.ref }}
+
+            Al finalizar el análisis:
+            1. Publica la revisión completa como comentario en el PR:
+               gh pr comment ${{ github.event.pull_request.number }} --repo BAP-Corporativo/FinvaApp --body "[revisión completa]"
+            2. Guarda un resumen ejecutivo en /tmp/pr_review_summary.txt con este formato exacto
+               (máximo 15 líneas, sin markdown, solo texto plano):
+               VEREDICTO: APROBADO_SIN_OBSERVACIONES | APROBADO_CON_ADVERTENCIAS | REQUIERE_CAMBIOS
+               CRITICOS: Ninguno | <lista separada por comas>
+               ADVERTENCIAS: Ninguna | <lista separada por comas>
+               POSITIVOS: <lista breve separada por comas>
+
+               Criterios de veredicto:
+               - APROBADO_SIN_OBSERVACIONES: sin problemas críticos ni advertencias
+               - APROBADO_CON_ADVERTENCIAS: sin problemas críticos, pero hay advertencias o mejoras menores
+               - REQUIERE_CAMBIOS: hay al menos un problema crítico que debe corregirse antes del merge
+
+      - name: Acción automática según veredicto
+        id: auto_action
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          SUMMARY_FILE="/tmp/pr_review_summary.txt"
+
+          if [ ! -f "$SUMMARY_FILE" ]; then
+            echo "action=sin_resumen" >> $GITHUB_OUTPUT
+            echo "⚠️ No se encontró el archivo de resumen — sin acción automática."
+            exit 0
+          fi
+
+          VEREDICTO=$(grep "^VEREDICTO:" "$SUMMARY_FILE" | sed 's/^VEREDICTO: *//')
+          echo "Veredicto detectado: $VEREDICTO"
+          echo "veredicto=$VEREDICTO" >> $GITHUB_OUTPUT
+
+          case "$VEREDICTO" in
+            APROBADO_SIN_OBSERVACIONES)
+              echo "action=merge_automatico" >> $GITHUB_OUTPUT
+              echo "✅ Sin observaciones — ejecutando merge automático..."
+              gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --auto \
+                --subject "$(gh pr view $PR_NUMBER --repo $REPO --json title -q .title)" \
+                --body "Merge automático — PR aprobado sin observaciones por Claude Code Review. 🤖"
+              ;;
+
+            APROBADO_CON_ADVERTENCIAS)
+              echo "action=pendiente_revision" >> $GITHUB_OUTPUT
+              echo "⚠️ Advertencias encontradas — notificando al autor..."
+              ADVERTENCIAS=$(grep "^ADVERTENCIAS:" "$SUMMARY_FILE" | sed 's/^ADVERTENCIAS: *//')
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(cat <<EOF
+          ## 🤖 Acción requerida — Claude Code Review
+
+          El análisis automático encontró **advertencias o mejoras menores** pero ningún problema crítico.
+
+          **Advertencias:**
+          $ADVERTENCIAS
+
+          @$PR_AUTHOR por favor revisa las observaciones en el comentario de revisión y decide si proceder con el merge.
+          EOF
+          )"
+              ;;
+
+            REQUIERE_CAMBIOS)
+              echo "action=cambios_solicitados" >> $GITHUB_OUTPUT
+              echo "🚨 Problemas críticos — solicitando cambios..."
+              CRITICOS=$(grep "^CRITICOS:" "$SUMMARY_FILE" | sed 's/^CRITICOS: *//')
+              gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes --body "$(cat <<EOF
+          ## 🚨 Claude Code Review — Cambios requeridos
+
+          Se encontraron problemas críticos que deben resolverse antes del merge:
+
+          $CRITICOS
+
+          Por favor corrige los problemas indicados en el comentario de revisión detallado y actualiza el PR.
+          EOF
+          )"
+              ;;
+
+            *)
+              echo "action=desconocido" >> $GITHUB_OUTPUT
+              echo "❓ Veredicto no reconocido: '$VEREDICTO' — sin acción automática."
+              ;;
+          esac
+
+      - name: Notificar Google Chat
+        if: always()
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: |
+          ACTION="${{ steps.auto_action.outputs.action }}"
+          STATUS="${{ job.status }}"
+
+          case "$ACTION" in
+            merge_automatico)
+              STATUS_ICON="✅"
+              STATUS_TEXT="Merge automático ejecutado"
+              STATUS_BODY="El PR fue aprobado sin observaciones y se realizó el merge automáticamente."
+              HEADER_COLOR="#1B8B4C"
+              ;;
+            pendiente_revision)
+              STATUS_ICON="⚠️"
+              STATUS_TEXT="Revisión manual requerida"
+              STATUS_BODY="Se encontraron advertencias menores. El autor debe revisar y decidir el merge."
+              HEADER_COLOR="#E6A817"
+              ;;
+            cambios_solicitados)
+              STATUS_ICON="🚨"
+              STATUS_TEXT="Cambios requeridos — PR bloqueado"
+              STATUS_BODY="Se encontraron problemas críticos que deben corregirse antes del merge."
+              HEADER_COLOR="#C0392B"
+              ;;
+            *)
+              if [ "$STATUS" = "success" ]; then
+                STATUS_ICON="🤖"
+                STATUS_TEXT="Revisión completada"
+                STATUS_BODY="Análisis finalizado. Revisa los comentarios en el PR para ver los detalles."
+                HEADER_COLOR="#3498DB"
+              else
+                STATUS_ICON="❌"
+                STATUS_TEXT="Error en la revisión"
+                STATUS_BODY="Ocurrió un error al ejecutar la revisión automática."
+                HEADER_COLOR="#7F8C8D"
+              fi
+              ;;
+          esac
+
+          CRITICOS="—"
+          ADVERTENCIAS="—"
+          POSITIVOS="—"
+          if [ -f /tmp/pr_review_summary.txt ]; then
+            CRITICOS=$(grep "^CRITICOS:" /tmp/pr_review_summary.txt | sed 's/^CRITICOS: *//' || echo "—")
+            ADVERTENCIAS=$(grep "^ADVERTENCIAS:" /tmp/pr_review_summary.txt | sed 's/^ADVERTENCIAS: *//' || echo "—")
+            POSITIVOS=$(grep "^POSITIVOS:" /tmp/pr_review_summary.txt | sed 's/^POSITIVOS: *//' || echo "—")
+          fi
+
+          jq -n \
+            --arg status_icon "$STATUS_ICON" \
+            --arg status_text "$STATUS_TEXT" \
+            --arg status_body "$STATUS_BODY" \
+            --arg header_color "$HEADER_COLOR" \
+            --arg pr_number "${{ github.event.pull_request.number }}" \
+            --arg pr_title "${{ github.event.pull_request.title }}" \
+            --arg author "${{ github.event.pull_request.user.login }}" \
+            --arg head "${{ github.event.pull_request.head.ref }}" \
+            --arg base "${{ github.event.pull_request.base.ref }}" \
+            --arg url "${{ github.event.pull_request.html_url }}" \
+            --arg criticos "$CRITICOS" \
+            --arg advertencias "$ADVERTENCIAS" \
+            --arg positivos "$POSITIVOS" \
+            '{
+              cardsV2: [{
+                cardId: "pr-review",
+                card: {
+                  header: {
+                    title: ("🤖 Claude Code Review  ·  PR #" + $pr_number),
+                    subtitle: ($pr_title),
+                    imageUrl: "https://www.gstatic.com/images/icons/material/system_gm/2x/code_black_24dp.png",
+                    imageType: "CIRCLE"
+                  },
+                  sections: [
+                    {
+                      header: ($status_icon + "  " + $status_text),
+                      collapsible: false,
+                      widgets: [
+                        { textParagraph: { text: $status_body } },
+                        {
+                          decoratedText: {
+                            startIcon: { knownIcon: "PERSON" },
+                            topLabel: "Autor",
+                            text: ("@" + $author)
+                          }
+                        },
+                        {
+                          decoratedText: {
+                            startIcon: { knownIcon: "DESCRIPTION" },
+                            topLabel: "Rama",
+                            text: ($head + "  →  " + $base)
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      header: "📋  Resultado del análisis",
+                      collapsible: true,
+                      uncollapsibleWidgetsCount: 1,
+                      widgets: [
+                        {
+                          decoratedText: {
+                            startIcon: { knownIcon: "STAR" },
+                            topLabel: "✅  Aspectos positivos",
+                            text: $positivos,
+                            wrapText: true
+                          }
+                        },
+                        {
+                          decoratedText: {
+                            startIcon: { knownIcon: "BOOKMARK" },
+                            topLabel: "⚠️  Advertencias",
+                            text: $advertencias,
+                            wrapText: true
+                          }
+                        },
+                        {
+                          decoratedText: {
+                            startIcon: { knownIcon: "MULTIPLE_PEOPLE" },
+                            topLabel: "🚨  Problemas críticos",
+                            text: $criticos,
+                            wrapText: true
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      widgets: [
+                        {
+                          buttonList: {
+                            buttons: [
+                              {
+                                text: "Ver review completo 🔗",
+                                onClick: { openLink: { url: $url } }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }]
+            }' \
+          | curl -s -X POST "$GOOGLE_CHAT_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d @-
