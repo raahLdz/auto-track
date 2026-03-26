@@ -9,13 +9,16 @@ name: PR Review — Claude Code
 #   CLAUDE_AUTH_METHOD = apikey   → usa ANTHROPIC_API_KEY (consume créditos de API)
 #
 # Secrets requeridos (configurar ambos para poder hacer switch sin fricción):
-#   CLAUDE_CODE_OAUTH_TOKEN  →  obtener con: security find-generic-password -s "Claude Code-credentials" -w | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['claudeAiOauth']['accessToken'])"
+#   CLAUDE_CODE_OAUTH_TOKEN  →  obtener con: 
+#                                 Mac: security find-generic-password -s "Claude Code-credentials" -w | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['claudeAiOauth']['accessToken'])"
+#                                 Windows: (Get-Content "$env:USERPROFILE\.claude\.credentials.json" | ConvertFrom-Json).claudeAiOauth.accessToken
 #   ANTHROPIC_API_KEY        →  obtener en: https://console.anthropic.com/settings/keys
+#   GOOGLE_CHAT_WEBHOOK      →  Google Chat → Space → Manage Webhooks
 
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review]
-    branches: [main, stage, dev]
+    branches: [main, dev]
 
 jobs:
   review:
@@ -26,6 +29,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      issues: write
       id-token: write
 
     steps:
@@ -45,7 +49,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           show_full_output: true
           prompt: &review_prompt |
-            Revisa el PR #${{ github.event.pull_request.number }} del repositorio BAP-Corporativo/FinvaApp.
+            Revisa el PR #${{ github.event.pull_request.number }} del repositorio ${{ github.repository }}.
 
             Sigue exactamente las instrucciones definidas en .claude/commands/review-pr.md.
 
@@ -56,7 +60,7 @@ jobs:
 
             Al finalizar el análisis:
             1. Publica la revisión completa como comentario en el PR:
-               gh pr comment ${{ github.event.pull_request.number }} --repo BAP-Corporativo/FinvaApp --body "[revisión completa]"
+               gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "[revisión completa]"
             2. Guarda un resumen ejecutivo en /tmp/pr_review_summary.txt con este formato exacto
                (máximo 15 líneas, sin markdown, solo texto plano):
                VEREDICTO: APROBADO_SIN_OBSERVACIONES | APROBADO_CON_ADVERTENCIAS | REQUIERE_CAMBIOS
@@ -67,7 +71,7 @@ jobs:
                Criterios de veredicto:
                - APROBADO_SIN_OBSERVACIONES: sin problemas críticos ni advertencias
                - APROBADO_CON_ADVERTENCIAS: sin problemas críticos, pero hay advertencias o mejoras menores
-               - REQUIERE_CAMBIOS: hay al menos un problema crítico que debe corregirse antes del merge
+               - REQUIERE_CAMBIOS: hay al menos un problema crítico de seguridad o funcionalidad que debe corregirse antes del merge
 
       # Modo API Key — consume créditos de Anthropic.
       # No usa OIDC, funciona aunque el workflow difiera de main. Ideal durante desarrollo.
@@ -80,7 +84,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           show_full_output: true
           prompt: |
-            Revisa el PR #${{ github.event.pull_request.number }} del repositorio BAP-Corporativo/FinvaApp.
+            Revisa el PR #${{ github.event.pull_request.number }} del repositorio ${{ github.repository }}.
 
             Sigue exactamente las instrucciones definidas en .claude/commands/review-pr.md.
 
@@ -91,7 +95,7 @@ jobs:
 
             Al finalizar el análisis:
             1. Publica la revisión completa como comentario en el PR:
-               gh pr comment ${{ github.event.pull_request.number }} --repo BAP-Corporativo/FinvaApp --body "[revisión completa]"
+               gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body "[revisión completa]"
             2. Guarda un resumen ejecutivo en /tmp/pr_review_summary.txt con este formato exacto
                (máximo 15 líneas, sin markdown, solo texto plano):
                VEREDICTO: APROBADO_SIN_OBSERVACIONES | APROBADO_CON_ADVERTENCIAS | REQUIERE_CAMBIOS
@@ -102,7 +106,7 @@ jobs:
                Criterios de veredicto:
                - APROBADO_SIN_OBSERVACIONES: sin problemas críticos ni advertencias
                - APROBADO_CON_ADVERTENCIAS: sin problemas críticos, pero hay advertencias o mejoras menores
-               - REQUIERE_CAMBIOS: hay al menos un problema crítico que debe corregirse antes del merge
+               - REQUIERE_CAMBIOS: hay al menos un problema crítico de seguridad o funcionalidad que debe corregirse antes del merge
 
       - name: Acción automática según veredicto
         id: auto_action
@@ -126,11 +130,18 @@ jobs:
 
           case "$VEREDICTO" in
             APROBADO_SIN_OBSERVACIONES)
-              echo "action=merge_automatico" >> $GITHUB_OUTPUT
-              echo "✅ Sin observaciones — ejecutando merge automático..."
-              gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --auto \
-                --subject "$(gh pr view $PR_NUMBER --repo $REPO --json title -q .title)" \
-                --body "Merge automático — PR aprobado sin observaciones por Claude Code Review. 🤖"
+              echo "action=aprobado" >> $GITHUB_OUTPUT
+              echo "✅ Sin observaciones — PR listo para merge."
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(cat <<EOF
+          ## ✅ Claude Code Review — Aprobado
+
+          El análisis automático no encontró problemas críticos ni advertencias.
+
+          El PR está listo para ser mergeado por un revisor humano.
+
+          🤖 *Revisión automática por Claude Code*
+          EOF
+          )"
               ;;
 
             APROBADO_CON_ADVERTENCIAS)
@@ -138,32 +149,39 @@ jobs:
               echo "⚠️ Advertencias encontradas — notificando al autor..."
               ADVERTENCIAS=$(grep "^ADVERTENCIAS:" "$SUMMARY_FILE" | sed 's/^ADVERTENCIAS: *//')
               gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(cat <<EOF
-          ## 🤖 Acción requerida — Claude Code Review
+          ## ⚠️ Claude Code Review — Revisión manual requerida
 
           El análisis automático encontró **advertencias o mejoras menores** pero ningún problema crítico.
 
-          **Advertencias:**
+          **Advertencias detectadas:**
           $ADVERTENCIAS
 
           @$PR_AUTHOR por favor revisa las observaciones en el comentario de revisión y decide si proceder con el merge.
+
+          🤖 *Revisión automática por Claude Code*
           EOF
           )"
               ;;
 
             REQUIERE_CAMBIOS)
-              echo "action=cambios_solicitados" >> $GITHUB_OUTPUT
-              echo "🚨 Problemas críticos — solicitando cambios..."
+              echo "action=pr_cerrado" >> $GITHUB_OUTPUT
+              echo "🚨 Problemas críticos encontrados — cerrando PR..."
               CRITICOS=$(grep "^CRITICOS:" "$SUMMARY_FILE" | sed 's/^CRITICOS: *//')
-              gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes --body "$(cat <<EOF
-          ## 🚨 Claude Code Review — Cambios requeridos
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(cat <<EOF
+          ## 🚨 Claude Code Review — PR Cerrado automáticamente
 
-          Se encontraron problemas críticos que deben resolverse antes del merge:
+          Se encontraron **problemas críticos** que impiden el merge. El PR ha sido cerrado automáticamente.
 
+          **Problemas críticos detectados:**
           $CRITICOS
 
-          Por favor corrige los problemas indicados en el comentario de revisión detallado y actualiza el PR.
+          @$PR_AUTHOR por favor corrige los problemas indicados en el comentario de revisión detallado, abre un nuevo PR o reactiva este una vez aplicados los cambios.
+
+          🤖 *Revisión automática por Claude Code*
           EOF
           )"
+              gh pr close "$PR_NUMBER" --repo "$REPO" \
+                --comment "PR cerrado automáticamente por Claude Code Review: se encontraron problemas críticos de seguridad o funcionalidad. Ver comentario de revisión para detalles. 🤖"
               ;;
 
             *)
@@ -178,37 +196,38 @@ jobs:
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
         run: |
           ACTION="${{ steps.auto_action.outputs.action }}"
-          STATUS="${{ job.status }}"
+          VEREDICTO="${{ steps.auto_action.outputs.veredicto }}"
+          JOB_STATUS="${{ job.status }}"
 
           case "$ACTION" in
-            merge_automatico)
+            aprobado)
               STATUS_ICON="✅"
-              STATUS_TEXT="Merge automático ejecutado"
-              STATUS_BODY="El PR fue aprobado sin observaciones y se realizó el merge automáticamente."
+              STATUS_TEXT="PR Aprobado — Listo para merge"
+              STATUS_BODY="El análisis no encontró problemas críticos ni advertencias. Requiere aprobación de un revisor humano para el merge."
               HEADER_COLOR="#1B8B4C"
               ;;
             pendiente_revision)
               STATUS_ICON="⚠️"
               STATUS_TEXT="Revisión manual requerida"
-              STATUS_BODY="Se encontraron advertencias menores. El autor debe revisar y decidir el merge."
+              STATUS_BODY="Se encontraron advertencias menores. El autor debe revisar y un revisor humano debe aprobar el merge."
               HEADER_COLOR="#E6A817"
               ;;
-            cambios_solicitados)
+            pr_cerrado)
               STATUS_ICON="🚨"
-              STATUS_TEXT="Cambios requeridos — PR bloqueado"
-              STATUS_BODY="Se encontraron problemas críticos que deben corregirse antes del merge."
+              STATUS_TEXT="PR Cerrado — Errores críticos detectados"
+              STATUS_BODY="Se encontraron problemas críticos de seguridad o funcionalidad. El PR fue cerrado automáticamente."
               HEADER_COLOR="#C0392B"
               ;;
             *)
-              if [ "$STATUS" = "success" ]; then
+              if [ "$JOB_STATUS" = "success" ]; then
                 STATUS_ICON="🤖"
                 STATUS_TEXT="Revisión completada"
                 STATUS_BODY="Análisis finalizado. Revisa los comentarios en el PR para ver los detalles."
                 HEADER_COLOR="#3498DB"
               else
                 STATUS_ICON="❌"
-                STATUS_TEXT="Error en la revisión"
-                STATUS_BODY="Ocurrió un error al ejecutar la revisión automática."
+                STATUS_TEXT="Error en la revisión automática"
+                STATUS_BODY="Ocurrió un error al ejecutar la revisión. Revisa los logs del workflow."
                 HEADER_COLOR="#7F8C8D"
               fi
               ;;
@@ -223,6 +242,7 @@ jobs:
             POSITIVOS=$(grep "^POSITIVOS:" /tmp/pr_review_summary.txt | sed 's/^POSITIVOS: *//' || echo "—")
           fi
 
+          # Construir y enviar el mensaje a Google Chat
           jq -n \
             --arg status_icon "$STATUS_ICON" \
             --arg status_text "$STATUS_TEXT" \
@@ -234,6 +254,7 @@ jobs:
             --arg head "${{ github.event.pull_request.head.ref }}" \
             --arg base "${{ github.event.pull_request.base.ref }}" \
             --arg url "${{ github.event.pull_request.html_url }}" \
+            --arg repo "${{ github.repository }}" \
             --arg criticos "$CRITICOS" \
             --arg advertencias "$ADVERTENCIAS" \
             --arg positivos "$POSITIVOS" \
@@ -243,7 +264,7 @@ jobs:
                 card: {
                   header: {
                     title: ("🤖 Claude Code Review  ·  PR #" + $pr_number),
-                    subtitle: ($pr_title),
+                    subtitle: $pr_title,
                     imageUrl: "https://www.gstatic.com/images/icons/material/system_gm/2x/code_black_24dp.png",
                     imageType: "CIRCLE"
                   },
@@ -263,8 +284,8 @@ jobs:
                         {
                           decoratedText: {
                             startIcon: { knownIcon: "DESCRIPTION" },
-                            topLabel: "Rama",
-                            text: ($head + "  →  " + $base)
+                            topLabel: "Repositorio · Rama",
+                            text: ($repo + "  |  " + $head + "  →  " + $base)
                           }
                         }
                       ]
