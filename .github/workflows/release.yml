@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - dev
 
 jobs:
   release:
@@ -34,6 +35,95 @@ jobs:
         run: yarn test --passWithNoTests
 
       - name: Release
+        id: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: yarn release
+
+      - name: Notificar Google Chat
+        if: always() && env.GOOGLE_CHAT_WEBHOOK != ''
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          JOB_STATUS="${{ job.status }}"
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            if [ "$BRANCH" = "main" ]; then
+              STATUS_ICON="🚀"
+              STATUS_TEXT="Nueva versión publicada en producción"
+              HEADER_COLOR="#1B8B4C"
+            else
+              STATUS_ICON="🧪"
+              STATUS_TEXT="Nueva versión prerelease publicada (dev)"
+              HEADER_COLOR="#3498DB"
+            fi
+            STATUS_BODY="El release se completó exitosamente. Revisa GitHub Releases para ver los detalles."
+          else
+            STATUS_ICON="❌"
+            STATUS_TEXT="Error en el proceso de release"
+            STATUS_BODY="El workflow de release falló. Revisa los logs para más información."
+            HEADER_COLOR="#C0392B"
+          fi
+
+          jq -n \
+            --arg status_icon "$STATUS_ICON" \
+            --arg status_text "$STATUS_TEXT" \
+            --arg status_body "$STATUS_BODY" \
+            --arg branch "$BRANCH" \
+            --arg repo "${{ github.repository }}" \
+            --arg run_url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg commit "${{ github.sha }}" \
+            --arg actor "${{ github.actor }}" \
+            '{
+              cardsV2: [{
+                cardId: "release",
+                card: {
+                  header: {
+                    title: ("🏷️ Release  ·  " + $repo),
+                    subtitle: ($status_icon + "  " + $status_text),
+                    imageUrl: "https://www.gstatic.com/images/icons/material/system_gm/2x/new_releases_black_24dp.png",
+                    imageType: "CIRCLE"
+                  },
+                  sections: [
+                    {
+                      collapsible: false,
+                      widgets: [
+                        { textParagraph: { text: $status_body } },
+                        {
+                          decoratedText: {
+                            startIcon: { knownIcon: "DESCRIPTION" },
+                            topLabel: "Rama",
+                            text: $branch
+                          }
+                        },
+                        {
+                          decoratedText: {
+                            startIcon: { knownIcon: "PERSON" },
+                            topLabel: "Disparado por",
+                            text: ("@" + $actor)
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      widgets: [
+                        {
+                          buttonList: {
+                            buttons: [
+                              {
+                                text: "Ver workflow 🔗",
+                                onClick: { openLink: { url: $run_url } }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }]
+            }' \
+          | curl -s -X POST "$GOOGLE_CHAT_WEBHOOK" \
+              -H "Content-Type: application/json" \
+              -d @-
