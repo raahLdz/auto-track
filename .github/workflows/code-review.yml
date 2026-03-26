@@ -1,8 +1,11 @@
-name: Claude Code Review
+name: Claude Code Review (Deshabilitado — ver pr-review.yml)
+
+# Este workflow fue reemplazado por pr-review.yml que incluye:
+# filtro de ramas, auto-cierre de PRs críticos y notificación a Google Chat.
+# Se mantiene como referencia del enfoque alternativo (Anthropic SDK directo).
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch: # Solo manual — no se dispara automáticamente
 
 permissions:
   contents: read
