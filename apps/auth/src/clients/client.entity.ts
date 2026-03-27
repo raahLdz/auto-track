@@ -5,10 +5,10 @@ export class Client {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column()
+  @Column({type: 'varchar', length: 50})
   name: string;
 
-  @Column({ name: 'last_name' })
+  @Column({ name: 'last_name', type: 'varchar', length: 50 })
   lastName: string;
 
   @Column({ unique: true })
