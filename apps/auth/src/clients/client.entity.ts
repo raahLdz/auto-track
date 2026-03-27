@@ -17,6 +17,9 @@ export class Client {
   @Column()
   phone: string;
 
+  @Column({ select: false })
+  password: string;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 

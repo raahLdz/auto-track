@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsEmail, IsNotEmpty, IsString, Matches } from 'class-validator';
+import { IsEmail, IsNotEmpty, IsString, MinLength, Matches } from 'class-validator';
 
 export class CreateClientDto {
   @ApiProperty({ example: 'Juan' })
@@ -20,4 +20,9 @@ export class CreateClientDto {
   @IsString()
   @Matches(/^\+?[1-9]\d{7,14}$/, { message: 'phone must be a valid phone number' })
   phone: string;
+
+  @ApiProperty({ example: 'mi_password_seguro', minLength: 8 })
+  @IsString()
+  @MinLength(8)
+  password: string;
 }
